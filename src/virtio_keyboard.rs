@@ -70,6 +70,8 @@ pub enum Key {
     Character(char),
     Enter,
     Backspace,
+    Escape,
+    Up,
 }
 
 #[repr(C)]
@@ -316,6 +318,12 @@ pub fn poll_key() -> Result<Option<Key>, Error> {
         }
         if event.code == 14 {
             return Ok(Some(Key::Backspace));
+        }
+        if event.code == 1 {
+            return Ok(Some(Key::Escape));
+        }
+        if event.code == 103 {
+            return Ok(Some(Key::Up));
         }
 
         if let Some(character) = key_character(event.code) {

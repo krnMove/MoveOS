@@ -2,9 +2,23 @@ use crate::{fat32::Fat32, println, scheduler, virtio_keyboard};
 
 const COMMAND_CAPACITY: usize = 256;
 
-pub fn run(volume: Option<Fat32>) -> ! {
+pub fn run(
+    volume: Option<Fat32>,
+    filesystem_error: Option<crate::fat32::Error>,
+    hours: u8,
+    minutes: u8,
+) {
     let mut command = [0u8; COMMAND_CAPACITY];
     let mut length = 0;
+    crate::console::draw_terminal(hours, minutes)
+        .unwrap_or_else(|_| panic!("virtio-gpu terminal drawing failed"));
+    if let Some(volume) = volume {
+        println!("Filesystem mounted: {} sectors", volume.total_sectors())
+            .unwrap_or_else(|_| panic!("virtio-gpu output failed"));
+    } else if let Some(error) = filesystem_error {
+        println!("Filesystem unavailable: {}", error)
+            .unwrap_or_else(|_| panic!("virtio-gpu output failed"));
+    }
     prompt();
 
     loop {
@@ -24,6 +38,8 @@ pub fn run(volume: Option<Fat32>) -> ! {
                 length -= 1;
                 crate::console::backspace().unwrap_or_else(|_| panic!("virtio-gpu output failed"));
             }
+            Some(virtio_keyboard::Key::Backspace) => return,
+            Some(virtio_keyboard::Key::Escape) => return,
             Some(virtio_keyboard::Key::Enter) => {
                 println!().unwrap_or_else(|_| panic!("virtio-gpu output failed"));
                 let verb_length = command[..length]
@@ -31,6 +47,10 @@ pub fn run(volume: Option<Fat32>) -> ! {
                     .position(u8::is_ascii_whitespace)
                     .unwrap_or(length);
                 command[..verb_length].make_ascii_lowercase();
+                let verb = &command[..verb_length];
+                if verb == b"exit" || verb == b"quit" || verb == b"/exit" {
+                    return;
+                }
                 execute(&command[..length], volume);
                 length = 0;
                 prompt();

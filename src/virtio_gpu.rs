@@ -24,6 +24,7 @@ const REG_QUEUE_NUM_MAX: usize = 0x034;
 const REG_QUEUE_NUM: usize = 0x038;
 const REG_QUEUE_READY: usize = 0x044;
 const REG_QUEUE_NOTIFY: usize = 0x050;
+const REG_INTERRUPT_STATUS: usize = 0x060;
 const REG_INTERRUPT_ACK: usize = 0x064;
 const REG_STATUS: usize = 0x070;
 const REG_QUEUE_DESC_LOW: usize = 0x080;
@@ -376,7 +377,7 @@ fn submit(command: *const u8, command_len: usize) -> Result<*const u8, Error> {
         }
         fence(Ordering::Acquire);
         COMPLETED_INDEX = COMPLETED_INDEX.wrapping_add(1);
-        let interrupt_status = mmio_read(base, REG_INTERRUPT_ACK);
+        let interrupt_status = mmio_read(base, REG_INTERRUPT_STATUS);
         if interrupt_status != 0 {
             mmio_write(base, REG_INTERRUPT_ACK, interrupt_status);
         }

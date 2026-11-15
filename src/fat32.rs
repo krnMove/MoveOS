@@ -248,6 +248,20 @@ impl Fat32 {
         Err(Error::CorruptVolume)
     }
 
+    pub fn entry_exists_83(&self, name: &str) -> Result<bool, Error> {
+        let short_name = to_short_name(name)?;
+        let mut found = false;
+        self.list_root(|entry| {
+            if entry.short_name == short_name {
+                found = true;
+                false
+            } else {
+                true
+            }
+        })?;
+        Ok(found)
+    }
+
     pub fn read_file_83(&self, name: &str, output: &mut [u8]) -> Result<usize, Error> {
         let short_name = to_short_name(name)?;
         let mut found = None;

@@ -227,10 +227,6 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|value| value & !(alignment - 1))
 }
 
-pub fn capacity_bytes() -> usize {
-    HEAP_SIZE
-}
-
 pub fn self_test() -> bool {
     let layout = match Layout::from_size_align(257, 64) {
         Ok(layout) => layout,

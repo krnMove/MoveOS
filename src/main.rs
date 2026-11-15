@@ -14,6 +14,7 @@ mod heap;
 mod mmu;
 mod scheduler;
 mod shell;
+mod ui;
 mod virtio_blk;
 mod virtio_gpu;
 mod virtio_keyboard;
@@ -45,26 +46,16 @@ pub extern "C" fn kernel_main() -> ! {
     if !heap::self_test() {
         panic!("heap allocation/alignment/reuse self-test failed");
     }
-    let (volume, disk_sectors, filesystem_error) = match fat32::Fat32::mount() {
-        Ok(volume) => (Some(volume), Some(volume.total_sectors()), None),
-        Err(error) => (None, None, Some(error)),
+    let (volume, filesystem_error) = match fat32::Fat32::mount() {
+        Ok(volume) => (Some(volume), None),
+        Err(error) => (None, Some(error)),
     };
 
     scheduler::init().unwrap_or_else(|error| panic!("scheduler initialization failed: {error}"));
     virtio_keyboard::init()
         .unwrap_or_else(|error| panic!("virtio keyboard initialization failed: {error}"));
 
-    console::draw_startup(
-        env!("CARGO_PKG_VERSION"),
-        heap::capacity_bytes() / 1024,
-        disk_sectors,
-        filesystem_error
-            .as_ref()
-            .map(|error| error as &dyn core::fmt::Display),
-    )
-    .unwrap_or_else(|_| panic!("virtio-gpu output failed"));
-
-    shell::run(volume)
+    ui::run(volume, filesystem_error)
 }
 
 static PANICKING: AtomicBool = AtomicBool::new(false);
