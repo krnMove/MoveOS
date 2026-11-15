@@ -82,6 +82,7 @@ impl Entry {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct FileName([u8; 11]);
 
 impl fmt::Display for FileName {
@@ -113,6 +114,29 @@ impl fmt::Display for FileName {
             }
         }
         Ok(())
+    }
+}
+
+impl FileName {
+    pub fn copy_to(&self, output: &mut [u8; 12]) -> usize {
+        output.fill(0);
+        let base_end = self.0[..8]
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |index| index + 1);
+        output[..base_end].copy_from_slice(&self.0[..base_end]);
+        let extension_end = self.0[8..]
+            .iter()
+            .rposition(|byte| *byte != b' ')
+            .map_or(0, |index| index + 1);
+        if extension_end == 0 {
+            base_end
+        } else {
+            output[base_end] = b'.';
+            output[base_end + 1..base_end + 1 + extension_end]
+                .copy_from_slice(&self.0[8..8 + extension_end]);
+            base_end + 1 + extension_end
+        }
     }
 }
 

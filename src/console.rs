@@ -18,6 +18,9 @@ const GRADIENT_END: u32 = 0xff3c_3f44;
 const HEADER_BACKGROUND: u32 = 0xff17_191d;
 const ACCENT: u32 = 0xffe8_f0_f8;
 const APP_BACKGROUND: u32 = LOCK_BACKGROUND;
+const FILES_BACKGROUND: u32 = 0xff27_292e;
+const FILES_SELECTED: u32 = 0xff41_454c;
+const FILES_SEPARATOR: u32 = 0xff4b_4f56;
 
 #[repr(align(4096))]
 struct Framebuffer([u32; MAX_WIDTH * MAX_HEIGHT]);
@@ -31,6 +34,19 @@ static mut TERMINAL_HOURS: u8 = 0;
 static mut TERMINAL_MINUTES: u8 = 0;
 static mut TERMINAL_ACTIVE: bool = false;
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+pub struct MoveFilesView<'a> {
+    pub creating_name: Option<&'a str>,
+    pub selected_index: usize,
+    pub selected_name: Option<&'a str>,
+    pub is_directory: bool,
+    pub contents: &'a [u8],
+    pub editing: bool,
+    pub dirty: bool,
+    pub confirm_discard: bool,
+    pub message: Option<&'a str>,
+    pub create_error: Option<fat32::Error>,
+}
 
 const FONT: [[u8; 7]; 36] = [
     [14, 17, 17, 31, 17, 17, 17], // A
@@ -197,10 +213,7 @@ pub fn draw_move_files(
     minutes: u8,
     volume: Option<fat32::Fat32>,
     filesystem_error: Option<fat32::Error>,
-    creating_name: Option<&str>,
-    created: bool,
-    already_exists: bool,
-    create_error: Option<fat32::Error>,
+    view: MoveFilesView<'_>,
 ) -> fmt::Result {
     if !is_initialized() {
         return Err(fmt::Error);
@@ -208,69 +221,110 @@ pub fn draw_move_files(
 
     unsafe {
         TERMINAL_ACTIVE = false;
-        fill_rect(0, 0, WIDTH, HEIGHT, APP_BACKGROUND);
+        fill_rect(0, 0, WIDTH, HEIGHT, FILES_BACKGROUND);
         draw_status_bar("MOVE FILES", hours, minutes, 4)?;
-        if let Some(name) = creating_name {
-            draw_text("NEW FILE:", 24, 52, 2, ACCENT);
-            draw_text(name, 24, 72, 2, FOREGROUND);
-        } else if created {
-            draw_text("CREATED", 24, 52, 2, ACCENT);
-        } else if already_exists {
-            draw_text("ALREADY EXISTS", 24, 52, 2, ACCENT);
-        } else if create_error.is_some() {
-            draw_text("CREATE ERROR", 24, 52, 2, ACCENT);
-        } else {
-            draw_text("FILES", 24, 52, 2, ACCENT);
-        }
-
-        if let Some(error) = create_error {
-            CURSOR_X = 24;
-            CURSOR_Y = 72;
-            write!(&mut FramebufferWriter, "{}", error)?;
+        let divider_x = (WIDTH / 3).max(240).min(WIDTH.saturating_sub(180));
+        let content_x = divider_x.saturating_add(24);
+        draw_text("FILES", 24, 52, 2, ACCENT);
+        draw_text(
+            if view.editing { "EDITOR" } else { "PREVIEW" },
+            content_x,
+            52,
+            2,
+            ACCENT,
+        );
+        fill_rect(divider_x, 48, 2, HEIGHT.saturating_sub(64), FILES_SEPARATOR);
+        if let Some(name) = view.creating_name {
+            draw_text("NEW FILE:", 24, 76, 1, ACCENT);
+            draw_text(name, 24, 90, 1, FOREGROUND);
         }
 
         if let Some(volume) = volume {
-            let list_y = if creating_name.is_some() || create_error.is_some() {
-                100
-            } else {
-                72
-            };
-            draw_file_entries(volume, list_y)?;
+            draw_file_panes(volume, &view, divider_x, content_x)?;
         } else {
-            CURSOR_X = 24;
-            CURSOR_Y = if creating_name.is_some() { 100 } else { 72 };
+            CURSOR_X = content_x;
+            CURSOR_Y = 84;
             if let Some(error) = filesystem_error {
                 write!(&mut FramebufferWriter, "{}", error)?;
             } else {
                 write!(&mut FramebufferWriter, "NO VOLUME MOUNTED")?;
             }
         }
+        if let Some(error) = view.create_error {
+            CURSOR_X = 24;
+            CURSOR_Y = HEIGHT.saturating_sub(44);
+            write!(&mut FramebufferWriter, "{}", error)?;
+        }
+        if let Some(message) = view.message {
+            draw_text(message, 24, HEIGHT.saturating_sub(24), 1, ACCENT);
+        } else if view.dirty {
+            draw_text("UNSAVED CHANGES", 24, HEIGHT.saturating_sub(24), 1, ACCENT);
+        }
         virtio_gpu::flush(WIDTH, HEIGHT).map_err(|_| fmt::Error)
     }
 }
 
-unsafe fn draw_file_entries(volume: fat32::Fat32, top: usize) -> fmt::Result {
-    unsafe {
-        CURSOR_X = 24;
-        CURSOR_Y = top;
-    }
-
+unsafe fn draw_file_panes(
+    volume: fat32::Fat32,
+    view: &MoveFilesView<'_>,
+    divider_x: usize,
+    content_x: usize,
+) -> fmt::Result {
+    const ROW_HEIGHT: usize = 24;
+    let list_top = if view.creating_name.is_some() {
+        112
+    } else {
+        80
+    };
+    let list_bottom = unsafe { HEIGHT }.saturating_sub(40);
+    let visible_rows = (list_bottom.saturating_sub(list_top) / ROW_HEIGHT).max(1);
+    let first_visible = view.selected_index.saturating_sub(visible_rows - 1);
     let mut writer = FramebufferWriter;
     let mut count = 0;
     let mut truncated = false;
     let mut write_failed = false;
     let result = volume.list_root(|entry| {
-        if unsafe { CURSOR_Y + CELL_HEIGHT > HEIGHT.saturating_sub(12) } {
+        let current = count;
+        count += 1;
+        if current < first_visible {
+            return true;
+        }
+        let visible_index = current - first_visible;
+        if visible_index >= visible_rows {
             truncated = true;
             return false;
         }
+        let row_y = list_top + visible_index * ROW_HEIGHT;
 
+        if current == view.selected_index {
+            unsafe {
+                fill_rect(
+                    16,
+                    row_y,
+                    divider_x.saturating_sub(24),
+                    ROW_HEIGHT - 2,
+                    FILES_SELECTED,
+                );
+            }
+        }
+        unsafe {
+            CURSOR_X = 24;
+            CURSOR_Y = row_y + 3;
+        }
         let suffix = if entry.is_directory() { "/" } else { "" };
         if writeln!(&mut writer, "{}{}", entry.name(), suffix).is_err() {
             write_failed = true;
             return false;
         }
-        count += 1;
+        unsafe {
+            fill_rect(
+                24,
+                row_y + ROW_HEIGHT - 2,
+                divider_x.saturating_sub(40),
+                1,
+                FILES_SEPARATOR,
+            );
+        }
         true
     });
 
@@ -281,17 +335,110 @@ unsafe fn draw_file_entries(volume: fat32::Fat32, top: usize) -> fmt::Result {
         Ok(()) if count == 0 => {
             unsafe {
                 CURSOR_X = 24;
-                CURSOR_Y = top;
+                CURSOR_Y = list_top;
             }
-            write!(&mut writer, "EMPTY")
+            writeln!(&mut writer, "EMPTY")?;
         }
-        Ok(()) if truncated => {
-            unsafe { draw_text("MORE", 100, 52, 2, ACCENT) };
-            Ok(())
+        Ok(()) => {}
+        Err(error) => writeln!(&mut writer, "READ ERROR: {}", error)?,
+    }
+
+    if truncated {
+        unsafe { draw_text("MORE", divider_x.saturating_sub(58), 52, 1, ACCENT) };
+    }
+    if let Some(name) = view.selected_name {
+        unsafe {
+            draw_text(name, content_x, 80, 2, FOREGROUND);
+            if view.is_directory {
+                draw_text("FOLDER", content_x, 110, 1, ACCENT);
+            } else if view.editing {
+                draw_text("TYPE TO APPEND  CTRL+S SAVE", content_x, 102, 1, ACCENT);
+            } else {
+                draw_text("E EDIT  UP/DOWN SELECT", content_x, 102, 1, ACCENT);
+            }
+            if view.confirm_discard {
+                draw_text("S SAVE  D DISCARD  ESC CANCEL", content_x, 118, 1, ACCENT);
+            } else if !view.is_directory {
+                draw_file_contents(view.contents, content_x, 126)?;
+            }
         }
-        Ok(()) => Ok(()),
-        Err(error) => {
-            writeln!(&mut writer, "READ ERROR: {}", error)
+    } else {
+        unsafe { draw_text("SELECT A FILE", content_x, 84, 1, ACCENT) };
+    }
+    Ok(())
+}
+
+unsafe fn draw_file_contents(contents: &[u8], x: usize, top: usize) -> fmt::Result {
+    let width = unsafe { WIDTH };
+    let height = unsafe { HEIGHT };
+    let characters_per_line = width
+        .saturating_sub(x + 24)
+        .checked_div(CELL_WIDTH * 2)
+        .unwrap_or(1)
+        .max(1);
+    let mut row = 0;
+    let mut column = 0;
+    if contents.is_empty() {
+        unsafe { draw_text("EMPTY FILE", x, top, 1, ACCENT) };
+        return Ok(());
+    }
+
+    for &byte in contents {
+        if byte == b'\r' {
+            continue;
+        }
+        if byte == b'\n' {
+            row += 1;
+            column = 0;
+        } else {
+            if column == characters_per_line {
+                row += 1;
+                column = 0;
+            }
+            let y = top + row * CELL_HEIGHT * 2;
+            if y + CELL_HEIGHT * 2 > height.saturating_sub(36) {
+                unsafe { draw_text("MORE", x, height.saturating_sub(40), 1, ACCENT) };
+                return Ok(());
+            }
+            let character = if byte.is_ascii_graphic() || byte == b' ' {
+                byte as char
+            } else if byte.is_ascii() {
+                '?'
+            } else {
+                unsafe { draw_text("NON-ASCII TEXT", x, top, 1, ACCENT) };
+                return Ok(());
+            };
+            unsafe { draw_scaled_glyph(character, x + column * CELL_WIDTH * 2, y, 2, FOREGROUND) };
+            column += 1;
+        }
+        if top + row * CELL_HEIGHT * 2 + CELL_HEIGHT * 2 > height.saturating_sub(36) {
+            unsafe { draw_text("MORE", x, height.saturating_sub(40), 1, ACCENT) };
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+unsafe fn draw_scaled_glyph(character: char, x: usize, y: usize, scale: usize, color: u32) {
+    let width = unsafe { WIDTH };
+    let height = unsafe { HEIGHT };
+    let buffer = unsafe { addr_of_mut!(FRAMEBUFFER.0) as *mut u32 };
+    for (row, bits) in glyph(character).iter().enumerate() {
+        for column in 0..5 {
+            if bits & (1 << (4 - column)) == 0 {
+                continue;
+            }
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let pixel_x = x + column * scale + dx;
+                    let pixel_y = y + row * scale + dy;
+                    if pixel_x < width && pixel_y < height {
+                        unsafe {
+                            write_volatile(buffer.add(pixel_y * width + pixel_x), color);
+                        }
+                    }
+                }
+            }
         }
     }
 }

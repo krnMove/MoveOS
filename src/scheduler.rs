@@ -1,6 +1,6 @@
 use core::fmt;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 const TASK_COUNT: usize = 2;
 const STACK_SIZE: usize = 16 * 1024;
@@ -39,8 +39,6 @@ static mut CURRENT_TASK: usize = 0;
 static mut NEXT_TASK: usize = 0;
 static mut TASK_COUNT_ACTIVE: usize = 0;
 static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static COUNTERS: [AtomicU64; TASK_COUNT] = [const { AtomicU64::new(0) }; TASK_COUNT];
-
 #[derive(Clone, Copy, Debug)]
 pub enum Error {
     AlreadyInitialized,
@@ -113,26 +111,14 @@ pub fn yield_now() {
     }
 }
 
-pub fn task_count() -> usize {
-    unsafe { TASK_COUNT_ACTIVE }
-}
-
-pub fn task_runs(index: usize) -> Option<u64> {
-    COUNTERS
-        .get(index)
-        .map(|counter| counter.load(Ordering::Relaxed))
-}
-
 fn worker_one() -> ! {
     loop {
-        COUNTERS[0].fetch_add(1, Ordering::Relaxed);
         yield_now();
     }
 }
 
 fn worker_two() -> ! {
     loop {
-        COUNTERS[1].fetch_add(1, Ordering::Relaxed);
         yield_now();
     }
 }

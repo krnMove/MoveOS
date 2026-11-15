@@ -12,8 +12,17 @@ struct FilesState {
     creating: bool,
     name: [u8; 12],
     name_length: usize,
-    created: bool,
-    already_exists: bool,
+    selected_index: usize,
+    selected_name: [u8; 12],
+    selected_name_length: usize,
+    contents: [u8; 1024],
+    content_length: usize,
+    is_directory: bool,
+    content_available: bool,
+    editing: bool,
+    dirty: bool,
+    confirm_discard: bool,
+    message: Option<&'static str>,
     error: Option<fat32::Error>,
 }
 
@@ -23,14 +32,34 @@ impl FilesState {
             creating: false,
             name: [0; 12],
             name_length: 0,
-            created: false,
-            already_exists: false,
+            selected_index: 0,
+            selected_name: [0; 12],
+            selected_name_length: 0,
+            contents: [0; 1024],
+            content_length: 0,
+            is_directory: false,
+            content_available: false,
+            editing: false,
+            dirty: false,
+            confirm_discard: false,
+            message: None,
             error: None,
         }
     }
 
     fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_length]).expect("file name input must be ASCII")
+    }
+
+    fn selected_name(&self) -> Option<&str> {
+        if self.selected_name_length == 0 {
+            None
+        } else {
+            Some(
+                core::str::from_utf8(&self.selected_name[..self.selected_name_length])
+                    .expect("FAT32 short filename must be ASCII"),
+            )
+        }
     }
 
     fn draw(
@@ -45,15 +74,151 @@ impl FilesState {
             minutes,
             volume,
             filesystem_error,
-            if self.creating {
-                Some(self.name())
-            } else {
-                None
+            console::MoveFilesView {
+                creating_name: if self.creating {
+                    Some(self.name())
+                } else {
+                    None
+                },
+                selected_index: self.selected_index,
+                selected_name: self.selected_name(),
+                is_directory: self.is_directory,
+                contents: &self.contents[..self.content_length],
+                editing: self.editing,
+                dirty: self.dirty,
+                confirm_discard: self.confirm_discard,
+                message: self.message,
+                create_error: self.error,
             },
-            self.created,
-            self.already_exists,
-            self.error,
         )
+    }
+
+    fn refresh_selected(&mut self, volume: Option<fat32::Fat32>) {
+        self.selected_name_length = 0;
+        self.content_length = 0;
+        self.is_directory = false;
+        self.content_available = false;
+        self.error = None;
+        let Some(volume) = volume else {
+            return;
+        };
+        let mut current = 0;
+        let mut selected = None;
+        if let Err(error) = volume.list_root(|entry| {
+            if current == self.selected_index {
+                selected = Some(entry);
+                false
+            } else {
+                current += 1;
+                true
+            }
+        }) {
+            self.error = Some(error);
+            return;
+        }
+        let Some(entry) = selected else {
+            return;
+        };
+        self.selected_name_length = entry.name().copy_to(&mut self.selected_name);
+        self.is_directory = entry.is_directory();
+        if self.is_directory {
+            return;
+        }
+        let mut name = [0; 12];
+        name[..self.selected_name_length]
+            .copy_from_slice(&self.selected_name[..self.selected_name_length]);
+        let name = core::str::from_utf8(&name[..self.selected_name_length])
+            .expect("selected filename must be ASCII");
+        match volume.read_file_83(name, &mut self.contents) {
+            Ok(length) => {
+                self.content_length = length;
+                self.content_available = true;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn move_selection(&mut self, volume: Option<fat32::Fat32>, down: bool) {
+        let Some(volume) = volume else {
+            return;
+        };
+        let mut count = 0;
+        let result = volume.list_root(|_| {
+            count += 1;
+            true
+        });
+        if let Err(error) = result {
+            self.error = Some(error);
+            return;
+        }
+        if count == 0 {
+            self.selected_index = 0;
+            self.refresh_selected(Some(volume));
+            return;
+        }
+        let previous = self.selected_index;
+        if down {
+            self.selected_index = (self.selected_index + 1).min(count - 1);
+        } else {
+            self.selected_index = self.selected_index.saturating_sub(1);
+        }
+        if self.selected_index != previous {
+            self.editing = false;
+            self.dirty = false;
+            self.confirm_discard = false;
+            self.message = None;
+            self.refresh_selected(Some(volume));
+        }
+    }
+
+    fn save(&mut self, volume: Option<fat32::Fat32>) {
+        let (Some(volume), Some(name)) = (volume, self.selected_name()) else {
+            self.message = Some("NO FILE SELECTED");
+            return;
+        };
+        match volume.write_file_83(name, &self.contents[..self.content_length]) {
+            Ok(()) => {
+                self.dirty = false;
+                self.editing = false;
+                self.confirm_discard = false;
+                self.message = Some("SAVED");
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn discard(&mut self, volume: Option<fat32::Fat32>) {
+        self.editing = false;
+        self.dirty = false;
+        self.confirm_discard = false;
+        self.message = Some("CHANGES DISCARDED");
+        self.refresh_selected(volume);
+    }
+
+    fn create_selected_index(&mut self, volume: fat32::Fat32) {
+        let mut target = [0; 12];
+        target[..self.name_length].copy_from_slice(&self.name[..self.name_length]);
+        let target = &target[..self.name_length];
+        let mut index = 0;
+        let mut found = None;
+        if let Err(error) = volume.list_root(|entry| {
+            let mut name = [0; 12];
+            let length = entry.name().copy_to(&mut name);
+            if name[..length].eq_ignore_ascii_case(target) {
+                found = Some(index);
+                false
+            } else {
+                index += 1;
+                true
+            }
+        }) {
+            self.error = Some(error);
+        }
+        if let Some(index) = found {
+            self.selected_index = index;
+            self.refresh_selected(Some(volume));
+        }
     }
 }
 
@@ -139,6 +304,7 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
             Some(virtio_keyboard::Key::Character('2')) if matches!(screen, Screen::Desktop) => {
                 screen = Screen::Files;
                 files = FilesState::new();
+                files.refresh_selected(volume);
                 let (hours, minutes) = clock_time(minute);
                 files
                     .draw(hours, minutes, volume, filesystem_error)
@@ -146,12 +312,11 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
                 last_minute = minute;
             }
             Some(virtio_keyboard::Key::Character('n' | 'N'))
-                if matches!(screen, Screen::Files) && !files.creating =>
+                if matches!(screen, Screen::Files) && !files.creating && !files.editing =>
             {
                 files.creating = true;
                 files.name_length = 0;
-                files.created = false;
-                files.already_exists = false;
+                files.message = None;
                 files.error = None;
                 let (hours, minutes) = clock_time(minute);
                 files
@@ -169,7 +334,7 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
                     files.name[files.name_length] = character as u8;
                     files.name_length += 1;
                     files.error = None;
-                    files.already_exists = false;
+                    files.message = None;
                     let (hours, minutes) = clock_time(minute);
                     files
                         .draw(hours, minutes, volume, filesystem_error)
@@ -191,29 +356,51 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
                     .draw(hours, minutes, volume, filesystem_error)
                     .unwrap_or_else(|_| panic!("virtio-gpu file creation screen drawing failed"));
             }
+            Some(virtio_keyboard::Key::Backspace)
+                if matches!(screen, Screen::Files) && files.editing && !files.confirm_discard =>
+            {
+                if files.content_length > 0 {
+                    files.content_length -= 1;
+                    files.dirty = true;
+                    files.message = None;
+                }
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
             Some(virtio_keyboard::Key::Enter)
                 if matches!(screen, Screen::Files) && files.creating && files.name_length > 0 =>
             {
                 files.creating = false;
-                files.created = false;
-                files.already_exists = false;
-                let name = files.name();
+                files.message = None;
                 files.error = match volume {
-                    Some(volume) => match volume.entry_exists_83(name) {
-                        Ok(true) => {
-                            files.already_exists = true;
-                            None
-                        }
-                        Ok(false) => match volume.write_file_83(name, &[]) {
-                            Ok(()) => {
-                                files.created = true;
+                    Some(volume) => {
+                        let name_length = files.name_length;
+                        let mut name = [0; 12];
+                        name[..name_length].copy_from_slice(&files.name[..name_length]);
+                        let name = core::str::from_utf8(&name[..name_length])
+                            .expect("file name input must be ASCII");
+                        match volume.entry_exists_83(name) {
+                            Ok(true) => {
+                                files.message = Some("ALREADY EXISTS");
                                 None
                             }
+                            Ok(false) => match volume.write_file_83(name, &[]) {
+                                Ok(()) => {
+                                    files.message = Some("FILE CREATED");
+                                    files.create_selected_index(volume);
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            },
                             Err(error) => Some(error),
-                        },
-                        Err(error) => Some(error),
-                    },
-                    None => None,
+                        }
+                    }
+                    None => {
+                        files.message = Some("NO VOLUME MOUNTED");
+                        None
+                    }
                 };
                 files.name_length = 0;
                 let (hours, minutes) = clock_time(minute);
@@ -227,14 +414,134 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
                 files.creating = false;
                 files.name_length = 0;
                 files.error = None;
-                files.already_exists = false;
+                files.message = None;
                 let (hours, minutes) = clock_time(minute);
                 files
                     .draw(hours, minutes, volume, filesystem_error)
                     .unwrap_or_else(|_| panic!("virtio-gpu file list drawing failed"));
             }
+            Some(virtio_keyboard::Key::Up)
+                if matches!(screen, Screen::Files) && !files.creating && !files.editing =>
+            {
+                files.move_selection(volume, false);
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file list drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Down)
+                if matches!(screen, Screen::Files) && !files.creating && !files.editing =>
+            {
+                files.move_selection(volume, true);
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file list drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Character('e' | 'E'))
+                if matches!(screen, Screen::Files) && !files.creating && !files.editing =>
+            {
+                if files.selected_name_length == 0 {
+                    files.message = Some("SELECT A FILE");
+                } else if files.is_directory {
+                    files.message = Some("FOLDER EDITING NOT SUPPORTED");
+                } else if !files.content_available {
+                    files.message = Some("FILE CANNOT BE EDITED");
+                } else if files.contents[..files.content_length]
+                    .iter()
+                    .all(|byte| byte.is_ascii())
+                {
+                    files.editing = true;
+                    files.dirty = false;
+                    files.confirm_discard = false;
+                    files.message = None;
+                    files.error = None;
+                } else {
+                    files.message = Some("ONLY ASCII TEXT CAN BE EDITED");
+                }
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Save)
+                if matches!(screen, Screen::Files) && files.editing =>
+            {
+                files.save(volume);
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Character('s' | 'S'))
+                if matches!(screen, Screen::Files) && files.editing && files.confirm_discard =>
+            {
+                files.save(volume);
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Character('d' | 'D'))
+                if matches!(screen, Screen::Files) && files.editing && files.confirm_discard =>
+            {
+                files.discard(volume);
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Character(character))
+                if matches!(screen, Screen::Files) && files.editing && !files.confirm_discard =>
+            {
+                if character.is_ascii_graphic() || character == ' ' {
+                    if files.content_length < files.contents.len() {
+                        files.contents[files.content_length] = character as u8;
+                        files.content_length += 1;
+                        files.dirty = true;
+                        files.message = None;
+                    } else {
+                        files.message = Some("FILE LIMIT: 1024 BYTES");
+                    }
+                }
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Enter)
+                if matches!(screen, Screen::Files) && files.editing && !files.confirm_discard =>
+            {
+                if files.content_length < files.contents.len() {
+                    files.contents[files.content_length] = b'\n';
+                    files.content_length += 1;
+                    files.dirty = true;
+                    files.message = None;
+                } else {
+                    files.message = Some("FILE LIMIT: 1024 BYTES");
+                }
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
+            Some(virtio_keyboard::Key::Escape)
+                if matches!(screen, Screen::Files) && files.editing =>
+            {
+                if files.confirm_discard {
+                    files.confirm_discard = false;
+                } else if files.dirty {
+                    files.confirm_discard = true;
+                } else {
+                    files.editing = false;
+                }
+                let (hours, minutes) = clock_time(minute);
+                files
+                    .draw(hours, minutes, volume, filesystem_error)
+                    .unwrap_or_else(|_| panic!("virtio-gpu file editor drawing failed"));
+            }
             Some(virtio_keyboard::Key::Backspace | virtio_keyboard::Key::Escape)
-                if matches!(screen, Screen::Files) =>
+                if matches!(screen, Screen::Files) && !files.creating && !files.editing =>
             {
                 screen = Screen::Desktop;
                 let (hours, minutes) = clock_time(minute);

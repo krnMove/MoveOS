@@ -72,6 +72,8 @@ pub enum Key {
     Backspace,
     Escape,
     Up,
+    Down,
+    Save,
 }
 
 #[repr(C)]
@@ -152,6 +154,7 @@ static mut DEVICE_BASE: usize = 0;
 static mut AVAILABLE_INDEX: u16 = 0;
 static mut LAST_USED_INDEX: u16 = 0;
 static mut SHIFT: bool = false;
+static mut CONTROL: bool = false;
 static mut CAPS_LOCK: bool = false;
 
 fn read32(base: usize, register: usize) -> u32 {
@@ -306,6 +309,10 @@ pub fn poll_key() -> Result<Option<Key>, Error> {
             unsafe { SHIFT = event.value != 0 };
             continue;
         }
+        if event.code == 29 || event.code == 97 {
+            unsafe { CONTROL = event.value != 0 };
+            continue;
+        }
         if event.code == 58 && event.value == 1 {
             unsafe { CAPS_LOCK = !CAPS_LOCK };
             continue;
@@ -324,6 +331,12 @@ pub fn poll_key() -> Result<Option<Key>, Error> {
         }
         if event.code == 103 {
             return Ok(Some(Key::Up));
+        }
+        if event.code == 108 {
+            return Ok(Some(Key::Down));
+        }
+        if event.code == 31 && unsafe { CONTROL } {
+            return Ok(Some(Key::Save));
         }
 
         if let Some(character) = key_character(event.code) {

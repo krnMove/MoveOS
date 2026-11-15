@@ -1,9 +1,10 @@
 use core::arch::asm;
 use core::fmt;
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 
 const TABLE_ENTRIES: usize = 512;
 const BLOCK_SIZE: usize = 2 * 1024 * 1024;
+const PAGE_SIZE: usize = 4096;
 const RAM_BASE: usize = 0x4000_0000;
 const RAM_SIZE: usize = 0x4000_0000;
 const GIC_MMIO_BASE: usize = 0x0800_0000;
@@ -14,6 +15,10 @@ const ACCESS_FLAG: u64 = 1 << 10;
 const INNER_SHAREABLE: u64 = 0b11 << 8;
 const DEVICE_ATTRIBUTE_INDEX: u64 = 1 << 2;
 const EXECUTE_NEVER: u64 = (1 << 53) | (1 << 54);
+const PRIVILEGED_EXECUTE_NEVER: u64 = 1 << 53;
+const ACCESS_USER_READ_WRITE: u64 = 0b01 << 6;
+const ACCESS_USER_READ_ONLY: u64 = 0b11 << 6;
+const PAGE_DESCRIPTOR: u64 = 0b11;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; TABLE_ENTRIES]);
@@ -21,10 +26,20 @@ struct PageTable([u64; TABLE_ENTRIES]);
 static mut LEVEL1: PageTable = PageTable([0; TABLE_ENTRIES]);
 static mut LOW_MEMORY: PageTable = PageTable([0; TABLE_ENTRIES]);
 static mut HIGH_MEMORY: PageTable = PageTable([0; TABLE_ENTRIES]);
+static mut USER_TEXT_PAGES: PageTable = PageTable([0; TABLE_ENTRIES]);
+static mut USER_DATA_PAGES: PageTable = PageTable([0; TABLE_ENTRIES]);
+
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_data_start: u8;
+    static __user_data_end: u8;
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Error {
     UnsupportedAddressLayout,
+    UnsupportedUserRegion,
 }
 
 impl fmt::Display for Error {
@@ -32,6 +47,9 @@ impl fmt::Display for Error {
         match self {
             Self::UnsupportedAddressLayout => {
                 formatter.write_str("RAM or device address exceeds the initial page tables")
+            }
+            Self::UnsupportedUserRegion => {
+                formatter.write_str("user text or data does not fit in its isolated page table")
             }
         }
     }
@@ -54,6 +72,50 @@ fn map_identity_region(
         table.0[first_entry + index] =
             block_descriptor(physical_base + index * BLOCK_SIZE, attributes);
     }
+}
+
+fn map_user_region(
+    high_memory: &mut PageTable,
+    pages: &mut PageTable,
+    start: usize,
+    end: usize,
+    user_attributes: u64,
+) -> Result<(), Error> {
+    if start < RAM_BASE
+        || end <= start
+        || end > RAM_BASE + RAM_SIZE
+        || start % PAGE_SIZE != 0
+        || end % PAGE_SIZE != 0
+    {
+        return Err(Error::UnsupportedUserRegion);
+    }
+
+    let first_block = (start - RAM_BASE) / BLOCK_SIZE;
+    let last_block = (end - 1 - RAM_BASE) / BLOCK_SIZE;
+    if first_block != last_block {
+        return Err(Error::UnsupportedUserRegion);
+    }
+
+    let block_base = RAM_BASE + first_block * BLOCK_SIZE;
+    let normal_attributes = ACCESS_FLAG | INNER_SHAREABLE;
+    for index in 0..TABLE_ENTRIES {
+        let address = block_base + index * PAGE_SIZE;
+        pages.0[index] = (address as u64 & 0x0000_ffff_ffff_f000)
+            | normal_attributes
+            | PAGE_DESCRIPTOR
+            | EXECUTE_NEVER;
+    }
+
+    for address in (start..end).step_by(PAGE_SIZE) {
+        let index = (address - block_base) / PAGE_SIZE;
+        pages.0[index] = (address as u64 & 0x0000_ffff_ffff_f000)
+            | normal_attributes
+            | PAGE_DESCRIPTOR
+            | user_attributes;
+    }
+
+    high_memory.0[first_block] = (pages as *mut PageTable as u64) | TABLE_DESCRIPTOR;
+    Ok(())
 }
 
 pub fn init() -> Result<(), Error> {
@@ -111,6 +173,21 @@ pub fn init() -> Result<(), Error> {
             RAM_SIZE,
             normal_attributes,
         );
+
+        map_user_region(
+            &mut *addr_of_mut!(HIGH_MEMORY),
+            &mut *addr_of_mut!(USER_TEXT_PAGES),
+            addr_of!(__user_text_start) as usize,
+            addr_of!(__user_text_end) as usize,
+            ACCESS_USER_READ_ONLY | PRIVILEGED_EXECUTE_NEVER,
+        )?;
+        map_user_region(
+            &mut *addr_of_mut!(HIGH_MEMORY),
+            &mut *addr_of_mut!(USER_DATA_PAGES),
+            addr_of!(__user_data_start) as usize,
+            addr_of!(__user_data_end) as usize,
+            ACCESS_USER_READ_WRITE | EXECUTE_NEVER,
+        )?;
 
         let mair_el1 = 0x00ffu64;
         let tcr_el1 = 25u64
