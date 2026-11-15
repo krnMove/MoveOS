@@ -1,4 +1,4 @@
-# MoveOS
+MoveOS:
 
 Мобильная операционная система, построенная на собственной архитектуре ядра **MoveKernel (ARM64)**.
 
@@ -7,17 +7,7 @@
 - **Язык**: Rust (`no_std` / `no_main`)
 - **Ядро**: [MoveKernel ARM](https://github.com/krnMove/MoveKernel-ARM)
 
-## Скриншоты
-
-| Lock Screen | Desktop |
-| :---: | :---: |
-| ![Lock Screen](assets/lock-screen.png) | ![Desktop](assets/desktop.png) |
-
-| Terminal | Move Files |
-| :---: | :---: |
-| ![Terminal](assets/terminal.png) | ![Move Files](assets/move-files.png) |
-
-## Возможности
+Возможности:
 
 ### Графическая оболочка
 - Экран блокировки (Lock Screen) с часами.
@@ -26,11 +16,11 @@
 - Единая тёмная палитра и собственный шрифт 5x7.
 - Плавные переходы между экранами (Slide).
 
-### Приложения
+Приложения:
 - **Terminal**: полноэкранный терминал с доступом к FAT32. Команды: `/HELP`, `/TASKS`, `/LS`, `/CAT`, `/WRITE`, `/CLEAR`, `exit`.
 - **Move Files**: файловый менеджер, отображающий корень FAT32. Создаёт пустые файлы 8.3 по клавише `N`. Файлы, созданные в Terminal, сразу видны в списке.
 
-### Ядро (MoveKernel)
+Ядро (MoveKernel):
 - Загрузка в QEMU `virt` (Cortex-A57), свой загрузчик (`boot.s`) и линкер-скрипт.
 - ARM MMU: identity-map для RAM, GIC и virtio MMIO.
 - GICv3 (Generic Timer отключён).
@@ -39,7 +29,7 @@
 - FAT32: чтение, запись, создание и перезапись файлов в корне.
 - 1 MiB heap с выравниванием и повторным использованием блоков.
 
-## Управление в QEMU
+Управление в QEMU:
 
 | Действие | Клавиша |
 | :--- | :--- |
@@ -50,7 +40,7 @@
 | Создать файл в Move Files | `N`, затем имя 8.3 + `Enter` |
 | Выход из Terminal в shell | `/exit` (или `Esc` на пустой строке) |
 
-## Запуск в QEMU
+Запуск в QEMU:
 
 Соберите ядро и тестовый FAT32-образ с файлом `HELLO.TXT` одной командой:
 
