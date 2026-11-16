@@ -8,6 +8,19 @@ enum Screen {
     Files,
 }
 
+#[derive(Clone, Copy)]
+struct TouchStart {
+    x: u16,
+    y: u16,
+    ticks: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ContextMenu {
+    app_index: usize,
+    showing_info: bool,
+}
+
 struct FilesState {
     creating: bool,
     name: [u8; 12],
@@ -87,6 +100,7 @@ impl FilesState {
                 editing: self.editing,
                 dirty: self.dirty,
                 confirm_discard: self.confirm_discard,
+                keyboard: self.editing || self.creating,
                 message: self.message,
                 create_error: self.error,
             },
@@ -151,6 +165,7 @@ impl FilesState {
             self.error = Some(error);
             return;
         }
+
         if count == 0 {
             self.selected_index = 0;
             self.refresh_selected(Some(volume));
@@ -169,6 +184,18 @@ impl FilesState {
             self.message = None;
             self.refresh_selected(Some(volume));
         }
+    }
+
+    fn select_index(&mut self, volume: Option<fat32::Fat32>, index: usize) {
+        if self.selected_index == index {
+            return;
+        }
+        self.selected_index = index;
+        self.editing = false;
+        self.dirty = false;
+        self.confirm_discard = false;
+        self.message = None;
+        self.refresh_selected(volume);
     }
 
     fn save(&mut self, volume: Option<fat32::Fat32>) {
@@ -228,6 +255,8 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
     let mut last_minute = u64::MAX;
     let mut last_wallpaper_frame = u64::MAX;
     let mut files = FilesState::new();
+    let mut touch_start = None;
+    let mut context_menu: Option<ContextMenu> = None;
 
     loop {
         scheduler::run_one();
@@ -240,8 +269,9 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
         } else {
             ticks / (frequency / 8).max(1)
         };
-        let wallpaper_changed =
-            matches!(screen, Screen::Desktop) && wallpaper_frame != last_wallpaper_frame;
+        let wallpaper_changed = matches!(screen, Screen::Desktop)
+            && context_menu.is_none()
+            && wallpaper_frame != last_wallpaper_frame;
 
         if minute != last_minute || wallpaper_changed {
             last_minute = minute;
@@ -258,11 +288,64 @@ pub fn run(volume: Option<fat32::Fat32>, filesystem_error: Option<fat32::Error>)
                     .draw(hours, minutes, volume, filesystem_error)
                     .unwrap_or_else(|_| panic!("virtio-gpu file placeholder drawing failed")),
             }
+            if let Some(menu) = context_menu {
+                console::draw_context_menu(menu.app_index, menu.showing_info)
+                    .unwrap_or_else(|_| panic!("virtio-gpu context menu drawing failed"));
+            }
         }
 
-        match virtio_keyboard::poll_key()
-            .unwrap_or_else(|error| panic!("keyboard polling failed: {error}"))
-        {
+        let input = virtio_keyboard::poll_input()
+            .unwrap_or_else(|error| panic!("virtio input polling failed: {error}"));
+        let touch_key = match input {
+            Some(virtio_keyboard::Input::Pointer { x, y }) => {
+                console::move_pointer(x, y)
+                    .unwrap_or_else(|_| panic!("virtio-gpu pointer drawing failed"));
+                None
+            }
+            Some(virtio_keyboard::Input::Touch {
+                x,
+                y,
+                pressed: true,
+            }) => {
+                console::move_pointer(x, y)
+                    .unwrap_or_else(|_| panic!("virtio-gpu pointer drawing failed"));
+                touch_start = Some(TouchStart {
+                    x,
+                    y,
+                    ticks: elapsed_ticks(start),
+                });
+                None
+            }
+            Some(virtio_keyboard::Input::Touch {
+                x,
+                y,
+                pressed: false,
+            }) => {
+                console::move_pointer(x, y)
+                    .unwrap_or_else(|_| panic!("virtio-gpu pointer drawing failed"));
+                let start_touch = touch_start.take();
+                process_touch(
+                    start_touch,
+                    x,
+                    y,
+                    &mut screen,
+                    &mut files,
+                    &mut context_menu,
+                    volume,
+                    filesystem_error,
+                    frequency,
+                    elapsed_ticks(start),
+                    minute,
+                    wallpaper_frame,
+                )
+            }
+            _ => None,
+        };
+        let key = match input {
+            Some(virtio_keyboard::Input::Key(key)) => Some(key),
+            _ => touch_key,
+        };
+        match key {
             Some(virtio_keyboard::Key::Up) if matches!(screen, Screen::Lock) => {
                 screen = Screen::Desktop;
                 let (hours, minutes) = clock_time(minute);
@@ -587,4 +670,147 @@ fn elapsed_ticks(start: u64) -> u64 {
         );
     }
     current.wrapping_sub(start)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_touch(
+    start: Option<TouchStart>,
+    x: u16,
+    y: u16,
+    screen: &mut Screen,
+    files: &mut FilesState,
+    context_menu: &mut Option<ContextMenu>,
+    volume: Option<fat32::Fat32>,
+    filesystem_error: Option<fat32::Error>,
+    frequency: u64,
+    now: u64,
+    minute: u64,
+    wallpaper_frame: u64,
+) -> Option<virtio_keyboard::Key> {
+    let start = start?;
+    let (start_x, start_y) = console::touch_to_pixel(start.x, start.y);
+    let (end_x, end_y) = console::touch_to_pixel(x, y);
+    let dx = end_x as isize - start_x as isize;
+    let dy = end_y as isize - start_y as isize;
+
+    if let Some(menu) = *context_menu {
+        match console::context_menu_choice(end_x, end_y, menu.showing_info) {
+            Some(console::ContextAction::Info) => {
+                if let Some(menu) = context_menu.as_mut() {
+                    menu.showing_info = true;
+                    console::draw_context_menu(menu.app_index, true)
+                        .unwrap_or_else(|_| panic!("virtio-gpu context menu drawing failed"));
+                }
+            }
+            Some(console::ContextAction::Remove) => {
+                console::hide_desktop_icon(menu.app_index);
+                *context_menu = None;
+                draw_desktop_at(minute, wallpaper_frame);
+            }
+            Some(console::ContextAction::Close) | None => {
+                *context_menu = None;
+                draw_desktop_at(minute, wallpaper_frame);
+            }
+        }
+        return None;
+    }
+
+    if matches!(screen, Screen::Lock) && dy < -80 && dy.unsigned_abs() > dx.unsigned_abs() {
+        *screen = Screen::Desktop;
+        let (hours, minutes) = clock_time(minute);
+        console::unlock_to_desktop(hours, minutes, (wallpaper_frame as u16).wrapping_mul(8))
+            .unwrap_or_else(|_| panic!("virtio-gpu desktop drawing failed"));
+        return None;
+    }
+
+    if matches!(screen, Screen::Files)
+        && !files.creating
+        && !files.editing
+        && dx > 80
+        && dx.unsigned_abs() > dy.unsigned_abs()
+    {
+        *screen = Screen::Desktop;
+        draw_desktop_at(minute, wallpaper_frame);
+        return None;
+    }
+
+    if matches!(screen, Screen::Files)
+        && let Some(key) = console::keyboard_key_at(x, y)
+    {
+        return Some(key);
+    }
+
+    if matches!(screen, Screen::Desktop) {
+        let app_index = console::desktop_app_at(start_x, start_y)?;
+        let held_ticks = now.wrapping_sub(start.ticks);
+        if frequency > 0
+            && held_ticks >= frequency.saturating_mul(3) / 5
+            && console::desktop_app_at(end_x, end_y) == Some(app_index)
+        {
+            let menu = ContextMenu {
+                app_index,
+                showing_info: false,
+            };
+            *context_menu = Some(menu);
+            console::draw_context_menu(app_index, false)
+                .unwrap_or_else(|_| panic!("virtio-gpu context menu drawing failed"));
+            return None;
+        }
+        if console::desktop_app_at(end_x, end_y) == Some(app_index) {
+            return Some(virtio_keyboard::Key::Character(if app_index == 0 {
+                '1'
+            } else {
+                '2'
+            }));
+        }
+        return None;
+    }
+
+    if matches!(screen, Screen::Files) {
+        if dx.unsigned_abs() > 80 || dy.unsigned_abs() > 80 {
+            return None;
+        }
+        match console::files_touch_action_at(start_x, start_y, files.creating, files.selected_index)
+        {
+            Some(console::FilesTouchAction::Select(index)) => {
+                let mut count = 0;
+                if let Some(volume) = volume {
+                    if let Err(error) = volume.list_root(|_| {
+                        count += 1;
+                        true
+                    }) {
+                        files.error = Some(error);
+                    }
+                    if index < count {
+                        files.select_index(Some(volume), index);
+                    }
+                }
+                files
+                    .draw(
+                        clock_time(minute).0,
+                        clock_time(minute).1,
+                        volume,
+                        filesystem_error,
+                    )
+                    .unwrap_or_else(|_| panic!("virtio-gpu file list drawing failed"));
+                return None;
+            }
+            Some(console::FilesTouchAction::Edit) if !files.editing && !files.creating => {
+                return Some(virtio_keyboard::Key::Character('e'));
+            }
+            Some(console::FilesTouchAction::Edit) => {}
+            Some(console::FilesTouchAction::Back) => {
+                return Some(virtio_keyboard::Key::Escape);
+            }
+            None => {}
+        }
+    }
+
+    None
+}
+
+fn draw_desktop_at(minute: u64, wallpaper_frame: u64) {
+    let (hours, minutes) = clock_time(minute);
+    console::draw_desktop(hours, minutes, (wallpaper_frame as u16).wrapping_mul(8))
+        .unwrap_or_else(|_| panic!("virtio-gpu desktop drawing failed"));
 }

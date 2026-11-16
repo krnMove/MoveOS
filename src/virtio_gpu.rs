@@ -149,6 +149,7 @@ static mut USED: UsedRing = UsedRing {
 static mut COMMAND: CommandBuffer = CommandBuffer([0; 64]);
 static mut RESPONSE: ResponseBuffer = ResponseBuffer([0; 512]);
 static mut DEVICE_BASE: usize = 0;
+static mut FRAMEBUFFER_WIDTH: usize = 0;
 static mut AVAILABLE_INDEX: u16 = 0;
 static mut COMPLETED_INDEX: u16 = 0;
 
@@ -427,6 +428,7 @@ pub fn initialize(
     if width > max_width || height > max_height {
         return Err(Error::DisplayTooLarge);
     }
+    unsafe { FRAMEBUFFER_WIDTH = width };
     let byte_length = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(size_of::<u32>()))
@@ -473,10 +475,13 @@ pub fn initialize(
 }
 
 fn transfer_and_flush(rect: Rect) -> Result<(), Error> {
+    let offset = unsafe {
+        ((rect.y as u64 * FRAMEBUFFER_WIDTH as u64) + rect.x as u64) * size_of::<u32>() as u64
+    };
     let transfer = TransferCommand {
         header: ControlHeader::new(CMD_TRANSFER_TO_HOST_2D),
         rect,
-        offset: 0,
+        offset,
         resource_id: RESOURCE_ID,
         padding: 0,
     };
@@ -495,6 +500,15 @@ pub fn flush(width: usize, height: usize) -> Result<(), Error> {
     transfer_and_flush(Rect {
         x: 0,
         y: 0,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+pub fn flush_region(x: usize, y: usize, width: usize, height: usize) -> Result<(), Error> {
+    transfer_and_flush(Rect {
+        x: x as u32,
+        y: y as u32,
         width: width as u32,
         height: height as u32,
     })

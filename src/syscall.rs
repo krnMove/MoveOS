@@ -1,6 +1,9 @@
 use core::ptr::{addr_of, addr_of_mut};
 
-use crate::{fat32::Fat32, virtio_keyboard::Key};
+use crate::{
+    fat32::Fat32,
+    virtio_keyboard::{Input, Key},
+};
 
 const SYS_WRITE_TEXT: u64 = 1;
 const SYS_READ_KEY: u64 = 2;
@@ -128,16 +131,44 @@ fn syscall_write_text(pointer: u64, length: u64) -> u64 {
 fn syscall_read_key() -> u64 {
     loop {
         crate::scheduler::run_one();
-        match crate::virtio_keyboard::poll_key() {
-            Ok(Some(Key::Character(character))) if character.is_ascii() => {
+        match crate::virtio_keyboard::poll_input() {
+            Ok(Some(Input::Key(Key::Character(character)))) if character.is_ascii() => {
                 return character as u8 as u64;
             }
-            Ok(Some(Key::Enter)) => return KEY_ENTER,
-            Ok(Some(Key::Backspace)) => return KEY_BACKSPACE,
-            Ok(Some(Key::Escape)) => return KEY_ESCAPE,
+            Ok(Some(Input::Key(Key::Enter))) => return KEY_ENTER,
+            Ok(Some(Input::Key(Key::Backspace))) => return KEY_BACKSPACE,
+            Ok(Some(Input::Key(Key::Escape))) => return KEY_ESCAPE,
+            Ok(Some(Input::Pointer { x, y })) => {
+                crate::console::move_pointer(x, y)
+                    .unwrap_or_else(|_| panic!("virtio-gpu pointer drawing failed"));
+            }
+            Ok(Some(Input::Touch {
+                x,
+                y,
+                pressed: true,
+            })) => {
+                crate::console::move_pointer(x, y)
+                    .unwrap_or_else(|_| panic!("virtio-gpu pointer drawing failed"));
+                match crate::console::keyboard_key_at(x, y) {
+                    Some(Key::Character(character)) if character.is_ascii() => {
+                        return character as u8 as u64;
+                    }
+                    Some(Key::Enter) => return KEY_ENTER,
+                    Some(Key::Backspace) => return KEY_BACKSPACE,
+                    _ => {}
+                }
+            }
+            Ok(Some(Input::Touch {
+                x,
+                y,
+                pressed: false,
+            })) => {
+                crate::console::move_pointer(x, y)
+                    .unwrap_or_else(|_| panic!("virtio-gpu pointer drawing failed"));
+            }
             Ok(_) => core::hint::spin_loop(),
             Err(error) => {
-                crate::println!("Keyboard error: {}", error)
+                crate::println!("Input error: {}", error)
                     .unwrap_or_else(|_| panic!("virtio-gpu output failed"));
                 return u64::MAX;
             }

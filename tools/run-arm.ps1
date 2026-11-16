@@ -1,5 +1,7 @@
 param(
-    [string]$ImagePath = "target\fat32-test.img"
+    [string]$ImagePath = "target\fat32-test.img",
+    [ValidateSet("sdl", "gtk")]
+    [string]$Display = "gtk"
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,12 +31,13 @@ $qemuArguments = @(
     "-cpu", "cortex-a57",
     "-m", "128M",
     "-kernel", $kernelPath,
-    "-device", "virtio-gpu-device",
+    "-device", "virtio-gpu-device,xres=450,yres=800",
     "-device", "virtio-keyboard-device",
+    "-device", "virtio-tablet-device",
     "-drive", "if=none,id=disk0,file=$ImagePath,format=raw",
     "-device", "virtio-blk-device,drive=disk0",
     "-global", "virtio-mmio.force-legacy=false",
-    "-display", "sdl",
+    "-display", $Display,
     "-serial", "none"
 )
 
